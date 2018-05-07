@@ -19,9 +19,11 @@ def request_weather(lat, lon):
     This function make request to the openweathermap API.
     Return fully ready string that can be sent to user
     """
-
-    r = requests.get('http://api.openweathermap.org/data/2.5/weather?lang=ru&units=metric&'
+    try:
+        r = requests.get('http://api.openweathermap.org/data/2.5/weather?lang=ru&units=metric&'
                      'lat=' + lat + '&lon=' + lon + '&APPID=' + config.weather_appid)
+    except requests.RequestException:
+        return 'Try again later'
     weather_response = r.json()
 
     city = weather_response['name']
@@ -31,10 +33,44 @@ def request_weather(lat, lon):
     humidity = str(weather_response['main']['humidity'])  # влажность
     wind = str(weather_response['wind']['speed'])  # скорость ветра м/с
 
-    weather_message = "{}\n{}\nTemp: {}\nДавление: {}\nВлажность: {}\nВетер: {} м/с\n".format\
+    weather_message = "*{}*\n_{}_\n*Temp:* _{}_\n*Давление:* _{}_\n*Влажность:* _{}_\n*Ветер:* _{} м/с_\n".format\
         (city, description.capitalize(), current_temp, pressure, humidity, wind)
 
     return weather_message
+
+
+
+
+
+def request_weather_tmrw(lat, lon):
+    """
+    This function return weather for tomorrow
+    """
+    today = datetime.date.today()
+    tomorrow = today + datetime.timedelta(days=1)
+    weather_messages = []
+    try:
+        r = requests.get('http://api.openweathermap.org/data/2.5/forecast?lang=ru&units=metric&'
+                     'lat=' + lat + '&lon=' + lon + '&APPID=' + config.weather_appid)
+    except requests.RequestException:
+        return ['Try again later']
+    weather_response = r.json()
+    city = weather_response['city']['name']
+    tomorrow_weather = [x for x in weather_response['list'] if str(tomorrow) in x['dt_txt']]
+    for each in tomorrow_weather:
+        date = each['dt_txt']
+        description = each['weather'][0]['description']
+        current_temp = each['main']['temp']
+        pressure = str(each['main']['pressure'])  # давление
+        humidity = str(each['main']['humidity'])  # влажность
+        wind = str(each['wind']['speed'])  # скорость ветра м/с
+
+        res = "*{}*\n_{}_\n*Temp:* _{}_\n*Давление:* _{}_\n*Влажность:* _{}_\n*Ветер:* _{} м/с_\n".format\
+            (date, description.capitalize(), current_temp, pressure, humidity, wind)
+        weather_messages.append(res)
+    return weather_messages
+
+
 
 
 @dp.message_handler(commands=['start']) #/start
@@ -53,6 +89,7 @@ async def geo(msg):
 
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton(text='Оформить подписку', callback_data='set'))
+    keyboard.add(types.InlineKeyboardButton(text='Прогноз на завтра', callback_data='tomorrow'))
     lat = str(msg.location.latitude)
     lon = str(msg.location.longitude)
     # trying get and check last_update record in database for current user.
@@ -61,10 +98,10 @@ async def geo(msg):
         database = Database()
         data = database.get_data(msg.chat.id)
         now = datetime.datetime.now()
-        delta = (now - data.last_update).total_seconds() / 60 # delta between now and last_update
+        last_update = data.last_update
+        next_update = data.last_update + datetime.timedelta(hours=1)
 
-
-        if delta >= 60:
+        if now > next_update:
             # if last update were more than one hour
             # we make new request to the API and save it in DB
 
@@ -74,19 +111,19 @@ async def geo(msg):
             data.weather = weather_message
             data.last_update = datetime.datetime.now()
             database.session.commit()
-            await bot.send_message(msg.chat.id, weather_message, reply_markup=keyboard)
+            await bot.send_message(msg.chat.id, weather_message, reply_markup=keyboard, parse_mode='markdown')
 
-        elif delta <= 60:
+        elif now < next_update:
             await bot.send_message(msg.chat.id,
                                    'Слишком много обращений, попробуйте позже\n'
                                    'Последнее обновление: {}\n'
-                                   '{}'.format(data.last_update, data.weather))
+                                   '{}'.format(data.last_update, data.weather), parse_mode='markdown')
 
     except SQLAlchemyError:
         # if current user not in DB
         weather_message = request_weather(lat, lon)
         database.add_user(msg.chat.username, msg.chat.id, lat, lon, weather_message, datetime.datetime.now())
-        await bot.send_message(msg.chat.id, weather_message, reply_markup=keyboard)
+        await bot.send_message(msg.chat.id, weather_message, reply_markup=keyboard, parse_mode='markdown')
 
     finally:
         database.session.close()
@@ -106,7 +143,8 @@ async def set_subscribe(msg):
         keyboard.add(*[button_1h, button_3h, button_6h])
         keyboard.insert(types.InlineKeyboardButton('Сменить локацию', callback_data='start'))
         keyboard.insert(types.InlineKeyboardButton('Отписаться от рассылки', callback_data='unset'))
-        await bot.send_message(msg.chat.id, 'Подписка для {}'.format(city), reply_markup=keyboard)
+        keyboard.add(types.InlineKeyboardButton('Прогноз на завтра', callback_data='tomorrow'))
+        await bot.send_message(msg.chat.id, 'Подписка для {}'.format(city), reply_markup=keyboard, parse_mode='markdown')
 
 
     except SQLAlchemyError:
@@ -142,6 +180,20 @@ async def inline(callback):
         finally:
             database.session.close()
 
+    elif callback.data == 'tomorrow':
+        try:
+            database = Database()
+            data = database.get_data(callback.message.chat.id)
+            city = data.weather.split('\n')[0]
+            messages = request_weather_tmrw(data.lat, data.lon)
+            await bot.send_message(data.chat_id, 'Погода на завтра {}'.format(city), parse_mode='markdown')
+            for each in messages:
+                await bot.send_message(data.chat_id, each, parse_mode='markdown')
+        except SQLAlchemyError as e:
+            pass
+        finally:
+            database.session.close()
+
     else:
         try:
             database = Database()
@@ -161,7 +213,7 @@ async def inline(callback):
 
 
 
-
+#scheduler
 async def tick():
     date = int(datetime.datetime.now().strftime('%H'))
     if  date >= 8 and date <= 20: # send weather only in day-time
@@ -171,16 +223,15 @@ async def tick():
             for user in all_users:
                 chat_id = user.chat_id
                 period = user.period
-                last_update = user.last_update
                 now = datetime.datetime.now()
-                delta = (now - last_update).total_seconds() / 60
-                if delta > period * 60:
+                last_update = user.last_update
+                next_update = last_update + datetime.timedelta(hours=1*period)
+                if now > next_update:
                     weather = request_weather(user.lat, user.lon)
                     user.weather = weather
-                    user.last_update = now
+                    user.last_update = datetime.datetime.now()
                     database.session.commit()
-
-                    await bot.send_message(chat_id, weather)
+                    await bot.send_message(chat_id, weather, parse_mode='markdown')
 
         except SQLAlchemyError as e:
             pass
