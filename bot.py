@@ -1,0 +1,201 @@
+import datetime
+import requests
+import config
+from aiogram import Bot, types
+from aiogram.dispatcher import Dispatcher
+from aiogram.utils import executor
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from sqlalchemy.exc import SQLAlchemyError
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from db import Database, User
+
+
+bot = Bot(token=config.token)
+dp = Dispatcher(bot)
+
+
+def request_weather(lat, lon):
+    """
+    This function make request to the openweathermap API.
+    Return fully ready string that can be sent to user
+    """
+
+    r = requests.get('http://api.openweathermap.org/data/2.5/weather?lang=ru&units=metric&'
+                     'lat=' + lat + '&lon=' + lon + '&APPID=' + config.weather_appid)
+    weather_response = r.json()
+
+    city = weather_response['name']
+    description = weather_response['weather'][0]['description']
+    current_temp = weather_response['main']['temp']
+    pressure = str(weather_response['main']['pressure'])  # давление
+    humidity = str(weather_response['main']['humidity'])  # влажность
+    wind = str(weather_response['wind']['speed'])  # скорость ветра м/с
+
+    weather_message = "{}\n{}\nTemp: {}\nДавление: {}\nВлажность: {}\nВетер: {} м/с\n".format\
+        (city, description.capitalize(), current_temp, pressure, humidity, wind)
+
+    return weather_message
+
+
+@dp.message_handler(commands=['start']) #/start
+async def start_process(msg):
+
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    geo_button = types.KeyboardButton(text='Отправить местоположение', request_location=True)
+    keyboard.add(geo_button)
+    await bot.send_message(msg.chat.id, 'Окей! Мне потребуются твои координаты, для прогноза погоды.',
+                           reply_markup=keyboard)
+
+
+
+@dp.message_handler(content_types=['location'])
+async def geo(msg):
+
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton(text='Оформить подписку', callback_data='set'))
+    lat = str(msg.location.latitude)
+    lon = str(msg.location.longitude)
+    # trying get and check last_update record in database for current user.
+    # If record does not available in database we create new user
+    try:
+        database = Database()
+        data = database.get_data(msg.chat.id)
+        now = datetime.datetime.now()
+        delta = (now - data.last_update).total_seconds() / 60 # delta between now and last_update
+
+
+        if delta >= 60:
+            # if last update were more than one hour
+            # we make new request to the API and save it in DB
+
+            weather_message = request_weather(lat, lon)
+            data.lat = lat
+            data.lon = lon
+            data.weather = weather_message
+            data.last_update = datetime.datetime.now()
+            database.session.commit()
+            await bot.send_message(msg.chat.id, weather_message, reply_markup=keyboard)
+
+        elif delta <= 60:
+            await bot.send_message(msg.chat.id,
+                                   'Слишком много обращений, попробуйте позже\n'
+                                   'Последнее обновление: {}\n'
+                                   '{}'.format(data.last_update, data.weather))
+
+    except SQLAlchemyError:
+        # if current user not in DB
+        weather_message = request_weather(lat, lon)
+        database.add_user(msg.chat.username, msg.chat.id, lat, lon, weather_message, datetime.datetime.now())
+        await bot.send_message(msg.chat.id, weather_message, reply_markup=keyboard)
+
+    finally:
+        database.session.close()
+
+
+@dp.message_handler(commands=['set'])  #settings
+async def set_subscribe(msg):
+
+    try:
+        database = Database()
+        data = database.get_data(msg.chat.id)
+        city = data.weather.split('\n')[0]
+        keyboard = types.InlineKeyboardMarkup()
+        button_1h = types.InlineKeyboardButton('Каждый час', callback_data='1')
+        button_3h = types.InlineKeyboardButton('Каждые 3 часа', callback_data='3')
+        button_6h = types.InlineKeyboardButton('Каждые 6 часов', callback_data='6')
+        keyboard.add(*[button_1h, button_3h, button_6h])
+        keyboard.insert(types.InlineKeyboardButton('Сменить локацию', callback_data='start'))
+        keyboard.insert(types.InlineKeyboardButton('Отписаться от рассылки', callback_data='unset'))
+        await bot.send_message(msg.chat.id, 'Подписка для {}'.format(city), reply_markup=keyboard)
+
+
+    except SQLAlchemyError:
+        # user can't call settings if he doesn't get weather before
+        await bot.send_message(msg.chat.id, 'Для начала получите погоду /start')
+    finally:
+        database.session.close()
+
+
+
+
+@dp.callback_query_handler(func = lambda c: True) #callback processing
+async def inline(callback):
+
+    if callback.data == 'set':
+        await set_subscribe(callback.message)
+
+    elif callback.data == 'start':
+        await bot.edit_message_text('Меняем локацию...', callback.message.chat.id, callback.message.message_id)
+        await start_process(callback.message)
+
+    elif callback.data == 'unset':
+        try:
+            database = Database()
+            data = database.get_data(callback.message.chat.id)
+            data.subscribe = False
+            data.period = 0
+            database.session.commit()
+            database.session.close()
+            await bot.send_message(callback.message.chat.id, 'Вы успешно отписались от рассылки')
+        except SQLAlchemyError as e:
+            pass
+        finally:
+            database.session.close()
+
+    else:
+        try:
+            database = Database()
+            data = database.get_data(callback.message.chat.id)
+            data.subscribe = True
+            data.period = int(callback.data)
+            database.session.commit()
+            await bot.edit_message_text('Вы выбрали {} час(a)\n'
+                                        'Для смены локации /start\n'
+                                        'Для управления подпиской /set'.format(callback.data),
+                                        callback.message.chat.id, callback.message.message_id)
+        except SQLAlchemyError as e:
+            pass
+
+        finally:
+            database.session.close()
+
+
+
+
+async def tick():
+    date = int(datetime.datetime.now().strftime('%H'))
+    if  date >= 8 and date <= 20: # send weather only in day-time
+        try:
+            database = Database()
+            all_users = database.session.query(User).filter(User.subscribe).all() #get all users with active subscribe
+            for user in all_users:
+                chat_id = user.chat_id
+                period = user.period
+                last_update = user.last_update
+                now = datetime.datetime.now()
+                delta = (now - last_update).total_seconds() / 60
+                if delta > period * 60:
+                    weather = request_weather(user.lat, user.lon)
+                    user.weather = weather
+                    user.last_update = now
+                    database.session.commit()
+
+                    await bot.send_message(chat_id, weather)
+
+        except SQLAlchemyError as e:
+            pass
+
+        finally:
+            database.session.close()
+
+
+
+scheduler = AsyncIOScheduler()
+scheduler.add_job(tick, 'interval', seconds=60)
+scheduler.start()
+
+
+
+
+if __name__ == '__main__':
+    executor.start_polling(dp)
