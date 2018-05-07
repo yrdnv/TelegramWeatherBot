@@ -39,9 +39,6 @@ def request_weather(lat, lon):
     return weather_message
 
 
-
-
-
 def request_weather_tmrw(lat, lon):
     """
     This function return weather for tomorrow
@@ -54,6 +51,7 @@ def request_weather_tmrw(lat, lon):
                      'lat=' + lat + '&lon=' + lon + '&APPID=' + config.weather_appid)
     except requests.RequestException:
         return ['Try again later']
+
     weather_response = r.json()
     city = weather_response['city']['name']
     tomorrow_weather = [x for x in weather_response['list'] if str(tomorrow) in x['dt_txt']]
@@ -117,7 +115,7 @@ async def geo(msg):
             await bot.send_message(msg.chat.id,
                                    'Слишком много обращений, попробуйте позже\n'
                                    'Последнее обновление: {}\n'
-                                   '{}'.format(data.last_update, data.weather), parse_mode='markdown')
+                                   '{}\n /set - настройки'.format(data.last_update, data.weather), parse_mode='markdown')
 
     except SQLAlchemyError:
         # if current user not in DB
@@ -143,8 +141,10 @@ async def set_subscribe(msg):
         keyboard.add(*[button_1h, button_3h, button_6h])
         keyboard.insert(types.InlineKeyboardButton('Сменить локацию', callback_data='start'))
         keyboard.insert(types.InlineKeyboardButton('Отписаться от рассылки', callback_data='unset'))
+        keyboard.add(types.InlineKeyboardButton('Текущий прогноз', callback_data='now'))
         keyboard.add(types.InlineKeyboardButton('Прогноз на завтра', callback_data='tomorrow'))
-        await bot.send_message(msg.chat.id, 'Подписка для {}'.format(city), reply_markup=keyboard, parse_mode='markdown')
+        await bot.send_message(msg.chat.id, 'Подписка для {}\n Сообщения будут приходить только днем'
+                               .format(city), reply_markup=keyboard, parse_mode='markdown')
 
 
     except SQLAlchemyError:
@@ -161,6 +161,41 @@ async def inline(callback):
 
     if callback.data == 'set':
         await set_subscribe(callback.message)
+
+    elif callback.data == 'now':
+        try:
+            database = Database()
+            data = database.get_data(callback.message.chat.id)
+            keyboard = types.InlineKeyboardMarkup()
+            keyboard.add(types.InlineKeyboardButton(text='Оформить подписку', callback_data='set'))
+            keyboard.add(types.InlineKeyboardButton(text='Прогноз на завтра', callback_data='tomorrow'))
+            now = datetime.datetime.now()
+            last_update = data.last_update
+            next_update = data.last_update + datetime.timedelta(hours=1)
+            if now > next_update:
+            # if last update were more than one hour
+            # we make new request to the API and save it in DB
+
+                weather_message = request_weather(data.lat, data.lon)
+                data.weather = weather_message
+                data.last_update = datetime.datetime.now()
+                database.session.commit()
+                await bot.send_message(callback.message.chat.id, weather_message,
+                                       reply_markup=keyboard, parse_mode='markdown')
+
+            elif now < next_update:
+                await bot.send_message(callback.message.chat.id,
+                                       'Слишком много обращений, попробуйте позже\n'
+                                       'Последнее обновление: {}\n'
+                                       '{}\n /set - настройки'.
+                                       format(data.last_update, data.weather), parse_mode='markdown')
+
+
+        except SQLAlchemyError as e:
+            pass
+        finally:
+            database.session.close()
+
 
     elif callback.data == 'start':
         await bot.edit_message_text('Меняем локацию...', callback.message.chat.id, callback.message.message_id)
@@ -189,6 +224,7 @@ async def inline(callback):
             await bot.send_message(data.chat_id, 'Погода на завтра {}'.format(city), parse_mode='markdown')
             for each in messages:
                 await bot.send_message(data.chat_id, each, parse_mode='markdown')
+            await bot.send_message(callback.message.chat.id, '/set - настройки')
         except SQLAlchemyError as e:
             pass
         finally:
