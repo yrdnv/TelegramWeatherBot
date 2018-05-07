@@ -1,0 +1,2 @@
+token = ''
+weather_appid = ''
