@@ -267,7 +267,9 @@ async def tick():
                     user.weather = weather
                     user.last_update = datetime.datetime.now()
                     database.session.commit()
-                    await bot.send_message(chat_id, weather, parse_mode='markdown')
+                    keyboard = types.InlineKeyboardMarkup()
+                    keyboard.add(types.InlineKeyboardButton(text='Настройки', callback_data='set'))
+                    await bot.send_message(chat_id, weather, reply_markup=keyboard, parse_mode='markdown')
 
         except SQLAlchemyError as e:
             pass
