@@ -15,5 +15,5 @@ schedule==0.5.0
 six==1.11.0
 SQLAlchemy==1.2.7
 tzlocal==1.5.1
-urllib3==1.22
+urllib3==1.26.5
 yarl==1.2.2
